@@ -1,0 +1,102 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: workforcehub
+
+jobs:
+  test:
+    name: 1 - Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest --cov=app --cov-report=xml --cov-report=term -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  build-and-push:
+    name: 2 - Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
+      - name: Push image to ECR
+        run: docker push "${{ steps.meta.outputs.image }}"
+      - name: Save image digest
+        run: docker inspect --format='{{index .RepoDigests 0}}' "${{ steps.meta.outputs.image }}" > image-digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+
+  deploy:
+    name: 3 - Deploy to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ needs.build-and-push.outputs.image }}
+      HOST: ${{ secrets.EC2_HOST }}
+      SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+      - name: Copy config files
+        run: |
+          scp -i ~/.ssh/deploy_key docker-compose.prod.yml ec2-user@"$HOST":~/app/docker-compose.yml
+          scp -i ~/.ssh/deploy_key nginx/nginx.conf ec2-user@"$HOST":~/app/nginx/nginx.conf
+      - name: Pull image from ECR and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key ec2-user@"$HOST" "
+            set -e
+            cd ~/app
+            echo 'IMAGE=$IMAGE' > .env
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${IMAGE%%/*}
+            docker compose pull
+            docker compose up -d
+            docker image prune -f
+          "
+
+  verify:
+    name: 4 - Health check
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check that /health returns 200
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.EC2_HOST }}/health" || true)
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          exit 1
